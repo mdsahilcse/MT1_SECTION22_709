@@ -129,6 +129,13 @@ const server = http.createServer((request, response) => {
   });
 });
 
+server.on('error', error => {
+  if (error.code !== 'EADDRINUSE') throw error;
+
+  console.error(`Port ${PORT} is already in use. Stop the previous server before running npm start again.`);
+  process.exitCode = 1;
+});
+
 server.listen(PORT, () => {
   console.log(`Products API running at http://localhost:${PORT}/api/products`);
 });
