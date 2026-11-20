@@ -1,0 +1,7 @@
+{
+  "name": "mt1-section22-709",
+  "version": "1.0.0",
+  "private": true,
+  "author": "MD SAHIL",
+  "scripts": { "start": "node server.js" }
+}
