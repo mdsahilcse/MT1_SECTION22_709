@@ -3,72 +3,132 @@
 
 const http = require('node:http');
 
+const PORT = 3000;
+const MAX_BODY_BYTES = 16 * 1024;
+
+// Products are stored in memory and reset when the server restarts.
 const products = [];
 let nextId = 1;
 
-function send(res, status, data) {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
-  res.end(JSON.stringify(data));
+function sendJson(response, status, data) {
+  response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  response.end(JSON.stringify(data));
 }
 
-async function readProduct(req) {
-  let body = '';
-  req.setEncoding('utf8');
-  for await (const chunk of req) body += chunk;
-
-  const data = JSON.parse(body);
-  if (typeof data?.name !== 'string' || !data.name.trim() ||
-      typeof data.category !== 'string' || !data.category.trim() ||
-      !Number.isFinite(data.price)) {
-    throw new Error('Invalid product');
-  }
-  return { name: data.name.trim(), price: data.price, category: data.category.trim() };
+function sendError(response, status, message) {
+  sendJson(response, status, { error: message });
 }
 
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, 'http://localhost');
-  const match = /^\/api\/products(?:\/([^/]+))?\/?$/.exec(url.pathname);
-  if (!match) return send(res, 404, { error: 'Route not found' });
+function methodNotAllowed(response, allowedMethods) {
+  response.setHeader('Allow', allowedMethods);
+  sendError(response, 405, 'Method not allowed');
+}
 
-  const id = match[1];
-  const isItem = id !== undefined;
-  const index = isItem ? products.findIndex(p => String(p.id) === id) : -1;
-  if (isItem && index === -1) return send(res, 404, { error: 'Product not found' });
-
-  if (req.method === 'GET') {
-    if (isItem) return send(res, 200, products[index]);
-    const category = url.searchParams.get('category');
-    return send(res, 200, category === null ? products : products.filter(p => p.category === category));
+async function readProduct(request) {
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of request) {
+    bytes += chunk.length;
+    if (bytes <= MAX_BODY_BYTES) chunks.push(chunk);
   }
 
-  if (req.method === 'DELETE' && isItem) {
-    const [removed] = products.splice(index, 1);
-    return send(res, 200, removed);
+  if (bytes > MAX_BODY_BYTES) {
+    return { status: 413, error: 'Product JSON must be 16 KB or smaller' };
   }
 
-  if ((req.method === 'POST' && !isItem) || (req.method === 'PUT' && isItem)) {
-    let data;
-    try {
-      data = await readProduct(req);
-    } catch {
-      return send(res, 400, { error: 'Provide a JSON object with name, price, and category' });
+  let data;
+  try {
+    data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    return { status: 400, error: 'Request body must contain valid JSON' };
+  }
+
+  const { name, price, category } = data ?? {};
+  if (typeof name !== 'string' || !name.trim()) {
+    return { status: 400, error: 'Name must be non-empty text' };
+  }
+  if (!Number.isFinite(price)) {
+    return { status: 400, error: 'Price must be a number' };
+  }
+  if (typeof category !== 'string' || !category.trim()) {
+    return { status: 400, error: 'Category must be non-empty text' };
+  }
+
+  return { product: { name: name.trim(), price, category: category.trim() } };
+}
+
+async function saveProduct(request, response, existing) {
+  const { product, status, error } = await readProduct(request);
+  // A DELETE can finish while this request is still reading its body.
+  if (existing && !products.includes(existing)) {
+    return sendError(response, 404, 'Product not found');
+  }
+  if (error) return sendError(response, status, error);
+
+  const name = product.name.toLowerCase();
+  const duplicate = products.some(item => item !== existing && item.name.toLowerCase() === name);
+  if (duplicate) return sendError(response, 409, 'Product name already exists');
+
+  if (existing) {
+    Object.assign(existing, product);
+    return sendJson(response, 200, existing);
+  }
+
+  const created = { id: nextId++, ...product };
+  products.push(created);
+  sendJson(response, 201, created);
+}
+
+async function handleRequest(request, response) {
+  const url = new URL(request.url, 'http://localhost');
+  const route = /^\/api\/products(?:\/([^/]+))?\/?$/.exec(url.pathname);
+  if (!route) return sendError(response, 404, 'Route not found');
+
+  const [, id] = route;
+  if (id === undefined) {
+    switch (request.method) {
+      case 'GET': {
+        const category = url.searchParams.get('category');
+        const results = category === null
+          ? products
+          : products.filter(product => product.category === category);
+        return sendJson(response, 200, results);
+      }
+      case 'POST':
+        return saveProduct(request, response);
+      default:
+        return methodNotAllowed(response, 'GET, POST');
     }
-
-    // A product may have been deleted while the request body was arriving.
-    const existing = isItem && products.find(p => String(p.id) === id);
-    if (isItem && !existing) return send(res, 404, { error: 'Product not found' });
-    if (products.some(p => p !== existing && p.name.toLowerCase() === data.name.toLowerCase())) {
-      return send(res, 409, { error: 'Product name already exists' });
-    }
-    if (isItem) return send(res, 200, Object.assign(existing, data));
-
-    const product = { id: nextId++, ...data };
-    products.push(product);
-    return send(res, 201, product);
   }
 
-  res.setHeader('Allow', isItem ? 'GET, PUT, DELETE' : 'GET, POST');
-  send(res, 405, { error: 'Method not allowed' });
+  const index = products.findIndex(product => String(product.id) === id);
+  if (index === -1) return sendError(response, 404, 'Product not found');
+
+  switch (request.method) {
+    case 'GET':
+      return sendJson(response, 200, products[index]);
+    case 'PUT':
+      return saveProduct(request, response, products[index]);
+    case 'DELETE': {
+      const [removed] = products.splice(index, 1);
+      return sendJson(response, 200, removed);
+    }
+    default:
+      return methodNotAllowed(response, 'GET, PUT, DELETE');
+  }
+}
+
+const server = http.createServer((request, response) => {
+  handleRequest(request, response).catch(error => {
+    if (response.destroyed) return;
+    if (error instanceof TypeError && error.code === 'ERR_INVALID_URL') {
+      return sendError(response, 400, 'Invalid request URL');
+    }
+    console.error(error);
+    sendError(response, 500, 'Internal server error');
+  });
 });
 
-server.listen(3000, () => console.log('Products API running on http://localhost:3000'));
+server.listen(PORT, () => {
+  console.log(`Products API running at http://localhost:${PORT}/api/products`);
+});
